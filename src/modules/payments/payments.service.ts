@@ -1,0 +1,100 @@
+import { Injectable, NotFoundException, InternalServerErrorException } from '@nestjs/common';
+import { InjectModel } from '@nestjs/mongoose';
+import { Model } from 'mongoose';
+import { Payment, PaymentDocument } from './schemas/payment.schema';
+import { FlutterwaveService } from './flutterwave.service';
+import { PaystackService } from './paystack.service';
+
+@Injectable()
+export class PaymentsService {
+  constructor(
+    @InjectModel(Payment.name) private paymentModel: Model<PaymentDocument>,
+    private flutterwaveService: FlutterwaveService,
+    private paystackService: PaystackService,
+  ) {}
+
+  async create(createPaymentDto: any): Promise<PaymentDocument> {
+    const createdPayment = new this.paymentModel(createPaymentDto);
+    return createdPayment.save();
+  }
+
+  async initiatePayment(paymentData: {
+    amount: number;
+    email: string;
+    fullName: string;
+    phone: string;
+    purpose: string;
+    gateway: 'FLUTTERWAVE' | 'PAYSTACK';
+  }) {
+    const tx_ref = `SCPSN-${Date.now()}`;
+    const redirect_url = 'http://localhost:3000/payment-callback';
+
+    if (paymentData.gateway === 'FLUTTERWAVE') {
+      const payload = {
+        tx_ref,
+        amount: paymentData.amount,
+        currency: 'NGN',
+        redirect_url,
+        customer: {
+          email: paymentData.email,
+          phonenumber: paymentData.phone,
+          name: paymentData.fullName,
+        },
+        customizations: {
+          title: 'SCPSN Payments',
+          description: paymentData.purpose,
+          logo: 'https://scpsn.org.ng/logo.png',
+        },
+      };
+
+      const response = await this.flutterwaveService.initiatePayment(payload);
+      if (response.status === 'success') {
+        await this.create({
+          amount: paymentData.amount,
+          reference: tx_ref,
+          status: 'PENDING',
+          paymentMethod: 'FLUTTERWAVE',
+          transactionDetails: response.data,
+        });
+        return response.data.link;
+      }
+    } else if (paymentData.gateway === 'PAYSTACK') {
+      const payload = {
+        email: paymentData.email,
+        amount: paymentData.amount,
+        reference: tx_ref,
+        callback_url: redirect_url,
+        metadata: {
+          fullName: paymentData.fullName,
+          purpose: paymentData.purpose,
+        },
+      };
+
+      const response = await this.paystackService.initiatePayment(payload);
+      if (response.status) {
+        await this.create({
+          amount: paymentData.amount,
+          reference: tx_ref,
+          status: 'PENDING',
+          paymentMethod: 'PAYSTACK',
+          transactionDetails: response.data,
+        });
+        return response.data.authorization_url;
+      }
+    }
+
+    throw new InternalServerErrorException('Failed to initiate payment');
+  }
+
+  async findAll(): Promise<PaymentDocument[]> {
+    return this.paymentModel.find().populate('member').sort({ createdAt: -1 }).exec();
+  }
+
+  async updateStatus(reference: string, status: string): Promise<PaymentDocument> {
+    const updatedPayment = await this.paymentModel
+      .findOneAndUpdate({ reference }, { status }, { new: true })
+      .exec();
+    if (!updatedPayment) throw new NotFoundException('Payment record not found');
+    return updatedPayment;
+  }
+}
